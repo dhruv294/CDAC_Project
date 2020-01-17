@@ -9,6 +9,7 @@
 #include <linux/cdev.h>
 #include <linux/fs.h>
 #include <linux/interrupt.h>
+#include <linux/slab.h>
 
 static struct timer_list myTimer;
 static unsigned int gpioLED = 49;           ///< Default GPIO for the LED is 49
@@ -17,7 +18,13 @@ static unsigned int irqNumber;
 static unsigned int Interrupt_flag = 0; 
 static unsigned int gpioButton = 115; 
 
-struct cdev mycdev;
+typedef struct my_priv_struct
+{
+	struct cdev mycdev;
+	int dev_num;
+}my_priv_t;
+
+static my_priv_t *devices;
 static dev_t first;
 static int major = 250;
 
@@ -35,7 +42,7 @@ static char ledName[7] = "ledXXX";          ///< Null terminated default string 
 static bool ledOn = 0; 
 
 static irqreturn_t gpio_irq_handler(unsigned int irq, void *dev_id);
-static void timer_set(void);
+
 
 void MyTimerCallback(unsigned long data)
 {
@@ -49,6 +56,7 @@ void MyTimerCallback(unsigned long data)
 static int gpio_open(struct inode *pinode, struct file *pfile)
 {
 	printk(KERN_INFO "%s: gpio_open() is called.\n", THIS_MODULE->name);
+	pfile->private_data = container_of(pinode->i_cdev,my_priv_t,mycdev);
 	return 0;
 }
 
@@ -60,8 +68,40 @@ static int gpio_close(struct inode *pinode, struct file *pfile)
 
 ssize_t gpio_write(struct file *pfile, const char __user *pbuf, size_t size, loff_t *pfpos)
 {
-	printk(KERN_INFO "%s: gpio_read() is called.\n", THIS_MODULE->name);
-	return size;
+	my_priv_t *dev = (my_priv_t*)pfile->private_data;
+	int max_bytes, bytes_to_write, nbytes;
+	char value[10];
+	static unsigned int received_value;
+	printk(KERN_INFO "%s: gpio_write() is called.\n", THIS_MODULE->name);
+	max_bytes = 10 - *pfpos;
+	bytes_to_write = size < max_bytes? size : max_bytes;
+	if(bytes_to_write == 0)
+	{
+		printk(KERN_INFO "%s: No space left on device.\n", THIS_MODULE->name);
+		return -ENOSPC;
+	}
+	nbytes = bytes_to_write - copy_from_user(value, pbuf, bytes_to_write);
+	sscanf(value,"%u",&received_value);
+	printk(KERN_INFO "%s:received value: %u",THIS_MODULE->name,received_value);
+	if(dev->dev_num == 0)
+	{
+		ledOn = 0;
+		gpio_free(gpioLED); 
+		gpioLED = received_value;
+		gpio_request(gpioLED, "sysfs");        
+		gpio_direction_output(gpioLED, ledOn);   
+		printk(KERN_INFO "%s: GPIOLED opened!!!",THIS_MODULE->name);
+
+	}
+	else
+	{
+		gpio_free(gpioButton); 
+		gpioButton = received_value;
+		gpio_request(gpioButton, "sysfs");        
+		gpio_direction_input(gpioButton); 
+		printk(KERN_INFO "%s: GPIOButton opened!!!",THIS_MODULE->name);
+	}
+	return nbytes;
 }
 
 ssize_t gpio_read(struct file *pfile, char __user *pbuf, size_t size, loff_t *pfpos)
@@ -79,11 +119,9 @@ ssize_t gpio_read(struct file *pfile, char __user *pbuf, size_t size, loff_t *pf
 		return 0;	
 	}
 	sprintf(timer,"%u",s_BlinkPeriod);
-	printk(KERN_INFO "%s: conversion done.\n", THIS_MODULE->name);
 	printk(KERN_INFO "%s: timer :%s\n", THIS_MODULE->name,timer);
-	
+
 	nbytes = bytes_to_read - copy_to_user(pbuf,timer,bytes_to_read);
-	printk(KERN_INFO "%s: copies to user done.\n", THIS_MODULE->name);
 	*pfpos = *pfpos + nbytes;
 	return 0;
 }
@@ -129,6 +167,7 @@ static struct device *s_pDeviceObject;
 static int __init ebbLED_init(void){
 
 	int result;
+	int i;
 	printk(KERN_INFO "EBB LED: Hello from the EBB LED LKM!\n");
 	ledOn = 0;
 	gpio_request(gpioLED, "sysfs");          // gpioLED is 49 by default, request it
@@ -139,6 +178,14 @@ static int __init ebbLED_init(void){
 	gpio_direction_input(gpioButton);        // Set the button GPIO to be an input
 	gpio_set_debounce(gpioButton, 200);      // Debounce the button with a delay of 200ms
 
+	devices = (my_priv_t*)kmalloc(devcnt * sizeof(my_priv_t), GFP_KERNEL);
+	if(devices == NULL)
+	{
+		printk(KERN_INFO "%s: kmalloc() is failed.\n",THIS_MODULE->name);
+		result = -ENOMEM;
+		goto kmalloc_failed;
+	}
+	printk(KERN_INFO "%s: kmalloc() allocated device private struct array.\n", THIS_MODULE->name);
 
 	first = MKDEV(major, 0);
 	result = alloc_chrdev_region(&first, 0, devcnt, "DESD_gpio");
@@ -159,7 +206,7 @@ static int __init ebbLED_init(void){
 
 	}
 	devno = MKDEV(major,0);
-	if((device_create(s_pDeviceClass, NULL, devno, NULL, "GPIOLED")) == NULL)
+	if((s_pDeviceObject = device_create(s_pDeviceClass, NULL, devno, NULL, "GPIOLED")) == NULL)
 	{
 		printk(KERN_INFO "EBB LED:gpioLED creation failed!\n");
 		goto device_creation_failed;
@@ -180,50 +227,58 @@ static int __init ebbLED_init(void){
 		goto file_creation_failed;
 
 	}
-
-	cdev_init(&mycdev, &gpio_fops);
-	result = cdev_add(&mycdev, first, 1);
-
-	if(result != 0)
+	for(i =0; i < devcnt; i++)
 	{
-		printk(KERN_INFO "%s: cdev_add() is failed.\n", THIS_MODULE->name);
-		goto cdev_failed;
+		devices[i].dev_num = i;
+		cdev_init(&devices[i].mycdev, &gpio_fops);
+		devno = MKDEV(major,i);
+		result = cdev_add(&devices[i].mycdev, devno, 1);
+		if(result != 0)
+		{
+			printk(KERN_INFO "%s: cdev_add() is failed.\n", THIS_MODULE->name);
+			goto cdev_failed;
 
+		}
+		printk(KERN_INFO "%s: cdev_add() is successful.\n", THIS_MODULE->name);
 	}
+
+
 	irqNumber = gpio_to_irq(gpioButton);
 	printk(KERN_INFO "GPIO_TEST: The button is mapped to IRQ: %d\n", irqNumber);
 	result = request_irq(irqNumber,(irq_handler_t) gpio_irq_handler,IRQF_TRIGGER_RISING,"gpio_handler",NULL);
-	if(result != 0)
-	{
-		printk(KERN_INFO "%s: request-irq() failed.\n", THIS_MODULE->name);
-		goto irq_request_failed;
-
-	}
 	printk(KERN_INFO "GPIO_TEST: The interrupt request result is: %d\n", result);
 	return 0;
 
-irq_request_failed:
-	cdev_del(&mycdev);
 cdev_failed:
+	for(i=i-1; i>=0; i--)
+		cdev_del(&devices[i].mycdev);	
 	device_remove_file(s_pDeviceObject, &dev_attr_period);
 file_creation_failed:
+	i = devcnt;
 button_device_creation_failed:
-	device_destroy(s_pDeviceClass, first);
+	for(i = i -1; i >= 0; i--)
+	{
+		first = MKDEV(major,i);
+		device_destroy(s_pDeviceClass, first);
+	}
 device_creation_failed:
 	class_destroy(s_pDeviceClass);
 class_creation_failed:
-	unregister_chrdev_region(first, 1);
-alloc_chrdev_region_failed:
-	del_timer_sync(&myTimer);
-	gpio_free(gpioLED);                      // Free the LED GPO
+	unregister_chrdev_region(first, devcnt);
+alloc_chrdev_region_failed:  
+	kfree(devices);
+kmalloc_failed:
+	gpio_free(gpioLED);// Free the LED GPO
+	gpio_free(gpioButton);
 	return -1;
 
 }
 
 static void __exit ebbLED_exit(void){
-	int i;
+	int i = devcnt;
 	free_irq(irqNumber, NULL);
-	cdev_del(&mycdev);
+	for(i=i-1; i>=0; i--)
+		cdev_del(&devices[i].mycdev);	
 	device_remove_file(s_pDeviceObject, &dev_attr_period);
 	for(i = 0; i < devcnt; i++)
 	{
@@ -231,11 +286,12 @@ static void __exit ebbLED_exit(void){
 		device_destroy(s_pDeviceClass, devcnt);
 	}
 	class_destroy(s_pDeviceClass);
-	unregister_chrdev_region(first, 1);
+	unregister_chrdev_region(first, devcnt);
 	if(Interrupt_flag == 1)
 	{
-	del_timer_sync(&myTimer);
+		del_timer_sync(&myTimer);
 	}
+	kfree(devices);
 	gpio_set_value(gpioLED, 0);              // Turn the LED off, indicates device was unloaded
 	gpio_free(gpioLED);                      // Free the LED GPIO
 	gpio_free(gpioButton);           
@@ -244,32 +300,23 @@ static void __exit ebbLED_exit(void){
 
 static irqreturn_t gpio_irq_handler(unsigned int irq, void *dev_id){
 	printk(KERN_INFO "%s: interrupt received!\n",THIS_MODULE->name);
-	ledOn = !ledOn;// Invert the LED state on each button press
 	if(Interrupt_flag == 0)
 	{
-            gpio_set_value(gpioLED, ledOn);          // Set the physical LED accordingly
-	    	Interrupt_flag = 1;
+		ledOn = 1;
+		timer_config();
+		gpio_set_value(gpioLED, ledOn);          // Set the physical LED accordingly
+		Interrupt_flag = 1;
 	}
 	else
 	{
-	gpio_set_value(gpioLED, 0);          // Set the physical LED accordinglyi
-	Interrupt_flag = 0;
+		del_timer_sync(&myTimer);
+		gpio_set_value(gpioLED, 0);          // Set the physical LED accordinglyi
+		Interrupt_flag = 0;
 	}
-	timer_set();
 	return IRQ_HANDLED;      // Announce that the IRQ has been handled correctly
 }
 
-static void timer_set(void)
-{
-  if(Interrupt_flag == 0)
-	{
-	del_timer_sync(&myTimer);
-	}
-	else
-	{
-	timer_config();
-	}
-}
+
 module_init(ebbLED_init);
 module_exit(ebbLED_exit);
 

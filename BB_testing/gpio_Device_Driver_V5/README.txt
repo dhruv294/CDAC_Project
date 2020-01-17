@@ -1,1 +1,1 @@
-working
+GPIO read  with period status

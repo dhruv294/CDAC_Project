@@ -1,4 +1,4 @@
-Target := test_v6
+Target := test_v7
 obj-m := ${Target}.o
 KDIR :=/home/dhruvshn/BeagleBoneBlack/Linux_Porting/kernel/linux-4.4
 
