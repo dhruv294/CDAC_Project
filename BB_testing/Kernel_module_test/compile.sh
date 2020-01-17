@@ -1,0 +1,1 @@
+make ARCH=arm CROSS_COMILE=${CC}
