@@ -6,7 +6,7 @@
 int main()
 {
 int fd;
-char time[20];
+char time[50];
 int period;
 fd = open("/dev/GPIOLED",O_RDONLY);
 if(fd < 0)
