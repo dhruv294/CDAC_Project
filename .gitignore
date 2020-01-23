@@ -1,3 +1,7 @@
 Linux_Porting/
 Manuals/
-
+*.symers
+*.order
+*.mod.c
+*.mod.o
+*.o
